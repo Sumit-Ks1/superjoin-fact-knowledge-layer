@@ -1,0 +1,69 @@
+@import "tailwindcss";
+
+/*
+ * A reading interface, not a dashboard.
+ *
+ * The job is to let someone check a claim against its source, so the type is
+ * sized for prose and colour is spent almost entirely on the four verdict
+ * families — agree, conflict, context, unknown. Everything else is ink, paper
+ * and one hairline rule.
+ *
+ * Names declared here become Tailwind utilities directly: `--color-ink` gives
+ * `bg-ink`, `text-ink`, `border-ink`. That matters — the previous version wrote
+ * `bg-[--color-ink]`, which is Tailwind 3 syntax that compiles to nothing in
+ * Tailwind 4, so every coloured class in the app produced no CSS at all. A
+ * selected filter button was white text on no background: invisible.
+ */
+@theme {
+  /* Surfaces and text */
+  --color-ground: #f7f7f5;
+  --color-surface: #ffffff;
+  --color-ink: #1a1c20;
+  --color-muted: #5f6672;
+  --color-faint: #8b919c;
+  --color-line: #e2e3e7;
+  --color-line-strong: #cbcdd4;
+
+  /* Accent: a classic slate-navy. Used for selection and focus, nothing else,
+     so "this is active" never competes with "this is a conflict". */
+  --color-accent: #2c3e57;
+  --color-accent-hover: #223144;
+  --color-accent-soft: #eef1f6;
+
+  /* The four verdict families. */
+  --color-agree: #1a6d4f;
+  --color-agree-soft: #e9f5ef;
+  --color-conflict: #a52a2a;
+  --color-conflict-soft: #fbecec;
+  --color-context: #8a5a13;
+  --color-context-soft: #fdf3e3;
+  --color-unknown: #4d5460;
+  --color-unknown-soft: #f0f1f3;
+
+  --radius-card: 0.5rem;
+}
+
+html {
+  color-scheme: light;
+}
+
+body {
+  background: var(--color-ground);
+  color: var(--color-ink);
+}
+
+/* Figures must line up when stacked for comparison. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * One visible focus treatment for every interactive element. Filter buttons are
+ * operated from the keyboard as often as the mouse, and a focus ring that only
+ * shows on some of them is worse than none.
+ */
+:where(button, a, input, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 0.25rem;
+}
