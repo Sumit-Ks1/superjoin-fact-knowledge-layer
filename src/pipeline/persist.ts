@@ -36,6 +36,7 @@ import {
   type TableCell,
 } from "@/db/schema";
 import { log } from "@/lib/logger";
+import { isForeignKeyViolation, isMissingSchema } from "@/lib/pg-error";
 import { canonicalize } from "./normalize/text";
 import type { ChunkDraft } from "./chunk";
 import type { FactDraft } from "./extract/table";
@@ -45,8 +46,43 @@ type Db = ReturnType<typeof getDb>;
 
 /* ── stage tracking ───────────────────────────────────────────────────────── */
 
-/** Postgres foreign-key violation. */
-const FK_VIOLATION = "23503";
+/**
+ * Runs a write that is meaningless if the document has been deleted.
+ *
+ * Every table here has a foreign key to `documents`, and a document can be
+ * deleted at any moment — a user changing their mind is a normal event, and the
+ * pipeline that was mid-flight finds out by having a statement rejected.
+ *
+ * Writing rows for something that no longer exists is a no-op by definition, so
+ * it is treated as one. The alternative is what happened in production: the
+ * violation propagated, Inngest retried it three times, and the run was
+ * reported as failed for an action the user took on purpose.
+ */
+async function ignoringDeletedDocument(
+  documentId: string,
+  what: string,
+  write: () => Promise<unknown>,
+): Promise<boolean> {
+  try {
+    await write();
+    return true;
+  } catch (error) {
+    if (isForeignKeyViolation(error)) {
+      log.info("write skipped; document was deleted mid-run", { documentId, what });
+      return false;
+    }
+    if (isMissingSchema(error)) {
+      // A migration has not been run. Retrying cannot fix it, and the message
+      // should say so rather than surfacing a column name.
+      log.error("database schema is behind the code; run the pending migration", {
+        documentId,
+        what,
+        error,
+      });
+    }
+    throw error;
+  }
+}
 
 /**
  * Records stage progress.
@@ -66,8 +102,8 @@ export async function markStage(
 ): Promise<void> {
   const db = getDb();
   const now = new Date();
-  try {
-    await db
+  await ignoringDeletedDocument(documentId, `stage:${stage}`, () =>
+    db
     .insert(documentStages)
     .values({
       documentId,
@@ -91,14 +127,8 @@ export async function markStage(
         attempts: sql`${documentStages.attempts} + 1`,
         finishedAt: status === "done" || status === "failed" ? now : null,
       },
-    });
-  } catch (error) {
-    if ((error as { code?: string })?.code === FK_VIOLATION) {
-      log.info("stage skipped; document was deleted mid-run", { documentId, stage });
-      return;
-    }
-    throw error;
-  }
+    }),
+  );
 }
 
 /**
@@ -161,7 +191,8 @@ export async function recordIssues(
 ): Promise<void> {
   if (rows.length === 0) return;
   const db = getDb();
-  await db.insert(issues).values(
+  await ignoringDeletedDocument(documentId, "issues", () =>
+    db.insert(issues).values(
     rows.map((row) => ({
       documentId,
       corpusId,
@@ -171,6 +202,7 @@ export async function recordIssues(
       severity: row.severity ?? "warning",
       sample: row.sample ?? null,
     })),
+    ),
   );
 }
 
@@ -547,6 +579,41 @@ export async function registerQualifierKeys(
 
 /* ── facts ────────────────────────────────────────────────────────────────── */
 
+/**
+ * Removes the facts a given batch previously wrote.
+ *
+ * Extraction runs in slices, and a slice that fails partway is retried from the
+ * start. Without this the retry appends its rows a second time and the document
+ * ends up with duplicate facts — which then corroborate each other, inflating
+ * every count on the Findings screen.
+ *
+ * Scoped by the grids the batch owns, so slices never clear each other.
+ */
+export async function clearFactsForSources(
+  documentId: string,
+  sourceKeys: string[],
+): Promise<void> {
+  if (sourceKeys.length === 0) return;
+  const db = getDb();
+  await ignoringDeletedDocument(documentId, "facts:batch", () =>
+    db
+      .delete(facts)
+      .where(and(eq(facts.documentId, documentId), inArray(facts.sourceKey, sourceKeys))),
+  );
+}
+
+/** Removes prose facts for a chunk range, for the same reason. */
+export async function clearFactsForChunks(
+  documentId: string,
+  chunkIds: string[],
+): Promise<void> {
+  if (chunkIds.length === 0) return;
+  const db = getDb();
+  await ignoringDeletedDocument(documentId, "facts:prose-batch", () =>
+    db.delete(facts).where(and(eq(facts.documentId, documentId), inArray(facts.chunkId, chunkIds))),
+  );
+}
+
 export type SavedFact = { id: string; draft: FactDraft };
 
 /**
@@ -623,6 +690,9 @@ export async function saveFacts(
             scopeSignature: d.scopeSignature,
             claimKey: d.claimKey,
             relaxedKey: d.relaxedKey,
+            sourceKey: d.sourceKey || null,
+            rowIndex: d.rowIndex >= 0 ? d.rowIndex : null,
+            colIndex: d.colIndex >= 0 ? d.colIndex : null,
             confidence: d.confidence,
             extractionMethod: d.extractionMethod,
             quoteVerified: d.quoteVerified,

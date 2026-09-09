@@ -21,6 +21,7 @@ import { NonRetriableError } from "inngest";
 
 import { env } from "@/lib/env";
 import { log } from "@/lib/logger";
+import { isMissingSchema } from "@/lib/pg-error";
 import {
   runEmbedBatch,
   runEmbedChunks,
@@ -48,7 +49,17 @@ export const ingestDocument = inngest.createFunction(
     onFailure: async ({ event, error }) => {
       const { documentId } = event.data.event.data;
       log.error("ingest failed after retries", { documentId, error });
-      await setDocumentStatus(documentId, "failed", String(error?.message ?? error));
+
+      /*
+       * A missing column or table means a migration has not been run. That is
+       * a person's job, not a transient fault, so the document says so rather
+       * than reporting a generic failure that invites another retry.
+       */
+      const detail = isMissingSchema(error)
+        ? "The database schema is behind the application. Run the pending migrations in supabase/migrations."
+        : String(error?.message ?? error);
+
+      await setDocumentStatus(documentId, "failed", detail);
     },
   },
   { event: "document/uploaded" },
@@ -101,8 +112,18 @@ export const ingestDocument = inngest.createFunction(
     });
 
     /* 3. Extract — tables read back from the database, then prose in slices. */
-    const tables = await step.run("extract-tables", () => runExtractTables(documentId));
-    if (tables.gone) return { stopped: "document deleted" as const };
+    const tableBatch = Math.max(1, env.extractTableBatch);
+    let tableFacts = 0;
+
+    for (let i = 0; i < MAX_BATCHES; i++) {
+      const offset = i * tableBatch;
+      const out = await step.run(`extract-tables-${offset}`, () =>
+        runExtractTables(documentId, offset, tableBatch),
+      );
+      if (out.gone) return { stopped: "document deleted" as const };
+      if (out.processed === 0) break;
+      tableFacts += out.facts;
+    }
 
     const chunkBatch = Math.max(1, env.extractChunkBatch);
     let narrativeFacts = 0;
@@ -120,7 +141,7 @@ export const ingestDocument = inngest.createFunction(
 
     await step.run("extract-done", async () => {
       await markStage(documentId, "extract", "done", {
-        metrics: { tableFacts: tables.facts, narrativeFacts },
+        metrics: { tableFacts, narrativeFacts },
       });
       return true;
     });
@@ -165,7 +186,13 @@ export const ingestDocument = inngest.createFunction(
       data: { corpusId, documentIds: [documentId] },
     });
 
-    return { pages: prepared.pageCount, tables: tableCount, chunks: chunkOffset, embedded };
+    return {
+      pages: prepared.pageCount,
+      tables: tableCount,
+      chunks: chunkOffset,
+      facts: tableFacts + narrativeFacts,
+      embedded,
+    };
   },
 );
 

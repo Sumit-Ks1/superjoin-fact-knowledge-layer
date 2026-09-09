@@ -115,6 +115,9 @@ export const env = {
   get parsePageBatch() {
     return num("PARSE_PAGE_BATCH", 20);
   },
+  get extractTableBatch() {
+    return num("EXTRACT_TABLE_BATCH", 12);
+  },
   get extractChunkBatch() {
     return num("EXTRACT_CHUNK_BATCH", 8);
   },

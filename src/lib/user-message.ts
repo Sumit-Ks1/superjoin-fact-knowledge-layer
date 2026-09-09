@@ -40,6 +40,12 @@ const PATTERNS: { test: RegExp; message: string }[] = [
     message: "This document has more pages than the limit. Upload an excerpt.",
   },
   {
+    // Actionable, and only fixable by whoever deploys: say so plainly.
+    test: /schema is behind|does not exist|undefined column|undefined table|42703|42P01/i,
+    message:
+      "The database schema is behind the application. Run the pending migrations in supabase/migrations.",
+  },
+  {
     test: /RESOURCE_EXHAUSTED|429|quota|rate.?limit/i,
     message:
       "A model provider was temporarily unavailable. Everything that does not depend on it completed normally.",

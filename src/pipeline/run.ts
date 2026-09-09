@@ -34,6 +34,7 @@ import {
 } from "@/db/schema";
 import { env } from "@/lib/env";
 import { log } from "@/lib/logger";
+import { isForeignKeyViolation } from "@/lib/pg-error";
 import { downloadDocument } from "@/lib/supabase";
 import { boilerplateFromPatterns } from "@/pdf/boilerplate";
 import { extractGeometry, probeDocument } from "@/pdf/extract";
@@ -54,6 +55,8 @@ import {
 import { parsePeriod, type FiscalCalendar } from "./normalize/period";
 import {
   clearDerived,
+  clearFactsForChunks,
+  clearFactsForSources,
   loadNarrativeChunks,
   loadTables,
   markStage,
@@ -67,6 +70,36 @@ import {
   setDocumentStatus,
   type RelationRow,
 } from "./persist";
+
+/* ── deletion guard ─────────────────────────────────────────── */
+
+/**
+ * Runs a stage, treating "the document was deleted" as a normal ending.
+ *
+ * Every stage checks the document exists before it writes, but that leaves a
+ * window: a user can delete it *while* the stage is running, and the next
+ * insert fails on a foreign key. Without this the step is reported as failed and
+ * retried three times for something the user did deliberately.
+ *
+ * The check and this guard cover different halves of the same problem. The
+ * check makes the common case cheap; this makes the rare one correct.
+ */
+async function stoppingIfDeleted<T extends { gone?: boolean }>(
+  documentId: string,
+  stage: string,
+  gone: T,
+  body: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await body();
+  } catch (error) {
+    if (isForeignKeyViolation(error)) {
+      log.info("document deleted mid-run; stopping", { documentId, stage });
+      return gone;
+    }
+    throw error;
+  }
+}
 
 /* ── prepare ──────────────────────────────────────────────────────────────── */
 
@@ -88,15 +121,22 @@ export type PrepareOutcome = {
  * and a document names itself on its opening pages. Sampling keeps this step
  * far inside the time limit even for a very long filing.
  */
-export async function runPrepare(documentId: string): Promise<PrepareOutcome> {
+async function runPrepareInner(documentId: string): Promise<PrepareOutcome> {
   const db = getDb();
-  await markStage(documentId, "parse", "running");
 
+  /*
+   * Existence is checked before anything is written. Every table in the
+   * pipeline has a foreign key to `documents`, so marking a stage on a deleted
+   * document is a constraint violation on the very first statement — which is
+   * exactly how this failed in production.
+   */
   const [doc] = await db.select().from(documents).where(eq(documents.id, documentId)).limit(1);
   if (!doc) {
     log.info("document deleted mid-run; stopping", { documentId, stage: "prepare" });
     return { usable: false, gone: true, detail: "", pageCount: 0, subject: "", boilerplate: [] };
   }
+
+  await markStage(documentId, "parse", "running");
 
   const bytes = await downloadDocument(doc.storagePath);
 
@@ -188,7 +228,7 @@ export type ParseBatchOutcome = {
  * instead of one — about one paragraph per slice. No figure is lost; at worst a
  * sentence that qualifies one sits in the neighbouring chunk.
  */
-export async function runParseBatch(
+async function runParseBatchInner(
   documentId: string,
   fromPage: number,
   toPage: number,
@@ -243,7 +283,7 @@ function fiscalCalendarOf(fiscalYearEnd: string | null): FiscalCalendar {
   };
 }
 
-export type ExtractOutcome = { facts: number; gone?: boolean };
+export type ExtractOutcome = { facts: number; processed: number; gone?: boolean };
 
 /**
  * Reads every stored grid into facts.
@@ -253,14 +293,36 @@ export type ExtractOutcome = { facts: number; gone?: boolean };
  * parse of work already done, and the single biggest reason the pipeline could
  * not finish inside one invocation.
  */
-export async function runExtractTables(documentId: string): Promise<ExtractOutcome> {
-  await markStage(documentId, "extract", "running");
+async function runExtractTablesInner(
+  documentId: string,
+  offset = 0,
+  limit = Number.MAX_SAFE_INTEGER,
+): Promise<ExtractOutcome> {
   const db = getDb();
 
+  // Existence before any write; see `runPrepare`.
   const [doc] = await db.select().from(documents).where(eq(documents.id, documentId)).limit(1);
-  if (!doc) return { facts: 0, gone: true };
+  if (!doc) {
+    log.info("document deleted mid-run; stopping", { documentId, stage: "extract" });
+    return { facts: 0, processed: 0, gone: true };
+  }
 
-  const tables = await loadTables(documentId);
+  if (offset === 0) await markStage(documentId, "extract", "running");
+
+  const all = await loadTables(documentId);
+  const tables = all.slice(offset, offset + limit);
+  if (tables.length === 0) return { facts: 0, processed: 0 };
+
+  /*
+   * Clear this batch's previous output before rewriting it. A slice that failed
+   * partway is retried from the start, and appending twice would give the
+   * document duplicate facts that then corroborate each other.
+   */
+  await clearFactsForSources(
+    documentId,
+    tables.map((t) => t.sourceKey),
+  );
+
   const subject = doc.docType || doc.filename.replace(/\.pdf$/i, "");
   const fiscalCalendar = fiscalCalendarOf(doc.fiscalYearEnd);
 
@@ -293,7 +355,7 @@ export async function runExtractTables(documentId: string): Promise<ExtractOutco
     await recordIssues(documentId, doc.corpusId, unique.slice(0, 200));
   }
 
-  return { facts: drafts.length };
+  return { facts: drafts.length, processed: tables.length };
 }
 
 export type NarrativeOutcome = {
@@ -311,7 +373,7 @@ export type NarrativeOutcome = {
  * of hundred fact-bearing passages. Sequentially that is minutes of wall time —
  * fine for the pipeline as a whole, impossible for one invocation.
  */
-export async function runExtractNarrative(
+async function runExtractNarrativeInner(
   documentId: string,
   offset: number,
   limit: number,
@@ -353,6 +415,12 @@ export async function runExtractNarrative(
       });
     }
   }
+
+  // Same reason as the table batches: a retry must replace, not append.
+  await clearFactsForChunks(
+    documentId,
+    slice.map((c) => c.id),
+  );
 
   if (drafts.length > 0) {
     const chunkIdByOrdinal = new Map(slice.map((c) => [c.ordinal, c.id]));
@@ -408,13 +476,25 @@ export type EmbedOutcome = {
  * on, because the exact-key, reconciliation and arithmetic channels do not
  * depend on it.
  */
-export async function runEmbedBatch(
+async function runEmbedBatchInner(
   documentId: string,
   offset: number,
   limit: number,
 ): Promise<EmbedOutcome> {
-  if (offset === 0) await markStage(documentId, "normalize", "running");
   const db = getDb();
+
+  // Existence before any write; see `runPrepare`.
+  const [doc] = await db
+    .select({ id: documents.id })
+    .from(documents)
+    .where(eq(documents.id, documentId))
+    .limit(1);
+  if (!doc) {
+    log.info("document deleted mid-run; stopping", { documentId, stage: "normalize" });
+    return { facts: 0, processed: 0, skipped: false, gone: true };
+  }
+
+  if (offset === 0) await markStage(documentId, "normalize", "running");
 
   const rows = await db
     .select({
@@ -485,6 +565,15 @@ function toLinkable(row: FactRow, calendarByDoc: Map<string, FiscalCalendar>): L
     relaxedKey: row.relaxedKey,
     confidence: row.confidence,
     quarantined: row.quarantined,
+    /*
+     * Read straight off the row. Two rules depend on it: a grid never
+     * contradicts itself, and a printed total may only be summed against rows
+     * from its own column. Losing it silently turns both off — the pairs still
+     * get judged, just wrongly.
+     */
+    sourceKey: row.sourceKey ?? undefined,
+    rowIndex: row.rowIndex ?? undefined,
+    colIndex: row.colIndex ?? undefined,
   };
 }
 
@@ -526,19 +615,6 @@ export async function runLink(corpusId: string, documentIds: string[]): Promise<
   const linkable = rows.map((r) => toLinkable(r, calendarByDoc));
   const byId = new Map(linkable.map((f) => [f.id, f]));
 
-  // Positional metadata lives on the evidence rows, not on the fact.
-  const cells = await db.execute<{ fact_id: string; table_id: string | null; table_cell: { row: number; col: number } | null }>(
-    sql`select fact_id, table_id, table_cell from evidence where document_id in (select id from documents where corpus_id = ${corpusId})`,
-  );
-  for (const cell of cells as unknown as { fact_id: string; table_id: string | null; table_cell: { row: number; col: number } | null }[]) {
-    const fact = byId.get(cell.fact_id);
-    if (!fact) continue;
-    if (cell.table_id) fact.sourceKey = cell.table_id;
-    if (cell.table_cell) {
-      fact.rowIndex = cell.table_cell.row;
-      fact.colIndex = cell.table_cell.col;
-    }
-  }
 
   const pairs = keyCandidates(linkable);
   const seen = new Set(pairs.map((p) => pairKey(p.a, p.b)));
@@ -634,6 +710,72 @@ export async function runLink(corpusId: string, documentIds: string[]): Promise<
   return { facts: linkable.length, pairs: pairs.length, relations: written, byType };
 }
 
+
+/* ── guarded entry points ─────────────────────────────────────── */
+
+export function runPrepare(documentId: string): Promise<PrepareOutcome> {
+  return stoppingIfDeleted(
+    documentId,
+    "prepare",
+    { usable: false, gone: true, detail: "", pageCount: 0, subject: "", boilerplate: [] },
+    () => runPrepareInner(documentId),
+  );
+}
+
+export function runParseBatch(
+  documentId: string,
+  fromPage: number,
+  toPage: number,
+  boilerplatePatterns: string[],
+  chunkOrdinalOffset: number,
+): Promise<ParseBatchOutcome> {
+  return stoppingIfDeleted(
+    documentId,
+    `parse:${fromPage}-${toPage}`,
+    { tables: 0, chunks: 0, lowConfidencePages: 0, gone: true },
+    () => runParseBatchInner(documentId, fromPage, toPage, boilerplatePatterns, chunkOrdinalOffset),
+  );
+}
+
+export function runExtractTables(
+  documentId: string,
+  offset = 0,
+  limit = Number.MAX_SAFE_INTEGER,
+): Promise<ExtractOutcome> {
+  return stoppingIfDeleted(
+    documentId,
+    `extract-tables:${offset}`,
+    { facts: 0, processed: 0, gone: true },
+    () => runExtractTablesInner(documentId, offset, limit),
+  );
+}
+
+export function runExtractNarrative(
+  documentId: string,
+  offset: number,
+  limit: number,
+): Promise<NarrativeOutcome> {
+  return stoppingIfDeleted(
+    documentId,
+    `extract-prose:${offset}`,
+    { facts: 0, rejected: 0, processed: 0, skipped: false, gone: true },
+    () => runExtractNarrativeInner(documentId, offset, limit),
+  );
+}
+
+export function runEmbedBatch(
+  documentId: string,
+  offset: number,
+  limit: number,
+): Promise<EmbedOutcome> {
+  return stoppingIfDeleted(
+    documentId,
+    `embed:${offset}`,
+    { facts: 0, processed: 0, skipped: false, gone: true },
+    () => runEmbedBatchInner(documentId, offset, limit),
+  );
+}
+
 /* ── convenience ─────────────────────────────────────────────── */
 
 /**
@@ -667,8 +809,11 @@ export async function runAll(documentId: string, corpusId: string): Promise<void
     await markStage(documentId, "parse", "done", { metrics: { pages: prepared.pageCount } });
     await markStage(documentId, "chunk", "done", { metrics: { chunks: chunkOffset } });
 
-    const tables = await runExtractTables(documentId);
-    if (tables.gone) return;
+    const tableBatch = Math.max(1, env.extractTableBatch);
+    for (let offset = 0; ; offset += tableBatch) {
+      const out = await runExtractTables(documentId, offset, tableBatch);
+      if (out.gone || out.processed === 0) break;
+    }
 
     const chunkBatch = Math.max(1, env.extractChunkBatch);
     for (let offset = 0; ; offset += chunkBatch) {

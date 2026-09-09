@@ -514,6 +514,22 @@ export const facts = pgTable(
     /** hash(subject, predicate) — same measure, any period/scope. */
     relaxedKey: text("relaxed_key").notNull(),
 
+    /**
+     * Where this fact was read from: the grid's stable key, and its cell.
+     *
+     * Stored rather than re-derived from `evidence`, for two reasons. It lets
+     * an extraction batch delete and rewrite exactly its own rows, which is
+     * what makes a retried batch idempotent instead of duplicating facts. And
+     * it is what the arithmetic channel needs to confine a sum to one column of
+     * one grid — previously rebuilt by a raw join against evidence on every
+     * linking pass.
+     *
+     * Null for facts taken from prose, which have no grid.
+     */
+    sourceKey: text("source_key"),
+    rowIndex: integer("row_index"),
+    colIndex: integer("col_index"),
+
     confidence: real("confidence").notNull().default(0.5),
     extractionMethod: text("extraction_method").$type<ExtractionMethod>().notNull(),
     /** The quote was found verbatim in its chunk. False ⇒ never surfaced as fact. */
@@ -530,6 +546,7 @@ export const facts = pgTable(
     index("facts_corpus_claim_idx").on(t.corpusId, t.claimKey),
     index("facts_corpus_relaxed_idx").on(t.corpusId, t.relaxedKey),
     index("facts_document_idx").on(t.documentId),
+    index("facts_source_idx").on(t.documentId, t.sourceKey),
     index("facts_subject_idx").on(t.subjectEntityId),
     index("facts_predicate_idx").on(t.predicateId),
     index("facts_period_idx").on(t.periodStart, t.periodEnd),
