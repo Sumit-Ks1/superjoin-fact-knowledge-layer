@@ -170,7 +170,18 @@ export const ingestDocument = inngest.createFunction(
     }
 
     if (!embedSkipped) {
-      await step.run("embed-chunks", () => runEmbedChunks(documentId, 400));
+      /*
+       * Chunk vectors, in slices of their own. They are longer texts than a
+       * fact line, so they get a smaller batch than the fact loop above.
+       */
+      const chunkEmbedBatch = Math.max(1, env.embedChunkBatch);
+      for (let i = 0; i < MAX_BATCHES; i++) {
+        const out = await step.run(`embed-chunks-${i * chunkEmbedBatch}`, () =>
+          runEmbedChunks(documentId, i * chunkEmbedBatch, chunkEmbedBatch),
+        );
+        if (out.skipped || out.processed === 0) break;
+      }
+
       await step.run("embed-done", async () => {
         await markStage(documentId, "normalize", "done", { metrics: { facts: embedded } });
         return true;

@@ -119,6 +119,7 @@ arithmetic channel instead. This one rule removed most of the false positives.
 | pgvector in Postgres | Dedicated vector DB | One database, so a similarity search and a SQL filter are one query. |
 | Browser → Storage upload | Upload via API | Vercel caps bodies at 4.5 MB; the sample annual report is 6.7 MB. |
 | Batched stages | One pass per document | Free-tier functions stop at 60s. Slices cost seam effects at page boundaries; one pass cannot finish at all. |
+| Embed slices sized to the quota window | Sized to the time limit | The free embedding quota counts input texts, not calls, at 100 a minute — so the binding constraint on that stage is the provider, not the clock. |
 | Tables read back from Postgres | Re-parsing at extract time | Re-parsing put a second full parse on the critical path and was the main cause of timeouts. |
 | Open `qualifiers` JSONB | Fixed columns | A document can introduce a new dimension without a migration. |
 | Official SDKs | LangChain | Removed a HIGH SSRF advisory in a transitive dependency; smaller bundle; direct control over retry and fallback. |

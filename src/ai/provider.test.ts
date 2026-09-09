@@ -1,5 +1,5 @@
 /**
- * The two places a model call goes wrong in ways worth encoding.
+ * The three places a model call goes wrong in ways worth encoding.
  *
  * Response shape: providers wrap JSON in fences, prepend a sentence, or append
  * an explanation, even in JSON mode. Losing those responses would silently drop
@@ -7,11 +7,15 @@
  *
  * Retry classification: retrying a 400 burns quota to receive the same 400.
  * Not retrying a 429 throws away a document that would have succeeded.
+ *
+ * Retry timing: the embedding quota is a one-minute window, and backoff capped
+ * below it wakes up inside the same window every time. The provider states the
+ * reset; these assert that it is read rather than guessed at.
  */
 
 import { describe, expect, it } from "vitest";
 
-import { describeProviderError, extractJson, isRetryable } from "./provider";
+import { describeProviderError, extractJson, isRetryable, retryHintMs } from "./provider";
 
 describe("extractJson", () => {
   it("parses a bare object", () => {
@@ -133,5 +137,36 @@ describe("describeProviderError", () => {
 
   it("keeps a short unrecognised error intact", () => {
     expect(describeProviderError(new Error("socket hang up"))).toBe("socket hang up");
+  });
+});
+
+describe("retryHintMs", () => {
+  /* Verbatim from a gemini-embedding-001 429, trimmed to the parts that matter. */
+  const quotaError = new Error(
+    '{"error":{"code":429,"message":"You exceeded your current quota. ' +
+      "* Quota exceeded for metric: generativelanguage.googleapis.com/embed_content_free_tier_requests, limit: 100" +
+      '\nPlease retry in 23.484258793s.","status":"RESOURCE_EXHAUSTED",' +
+      '"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"23s"}]}}',
+  );
+
+  it("prefers the structured retryDelay", () => {
+    expect(retryHintMs(quotaError)).toBe(23_000);
+  });
+
+  it("falls back to the prose form, rounding up to clear the window", () => {
+    expect(retryHintMs(new Error("Please retry in 23.484258793s."))).toBe(23_485);
+  });
+
+  it("returns null when the provider said nothing, leaving jitter to decide", () => {
+    expect(retryHintMs(new Error("socket hang up"))).toBeNull();
+    expect(retryHintMs({ status: 503 })).toBeNull();
+  });
+
+  /*
+   * The bug this encodes: a 30s ceiling on a 60s window meant every retry was
+   * spent on a request that could not yet succeed.
+   */
+  it("reads a hint longer than the old backoff ceiling", () => {
+    expect(retryHintMs(new Error('"retryDelay":"47s"'))).toBe(47_000);
   });
 });

@@ -472,10 +472,7 @@ export async function saveChunks(
 export async function saveChunkEmbeddings(
   updates: { chunkId: string; embedding: number[] }[],
 ): Promise<void> {
-  const db = getDb();
-  for (const { chunkId, embedding } of updates) {
-    await db.update(chunks).set({ embedding }).where(eq(chunks.id, chunkId));
-  }
+  await updateEmbeddings("chunks", updates.map((u) => ({ id: u.chunkId, embedding: u.embedding })));
 }
 
 /* ── vocabularies ─────────────────────────────────────────────────────────── */
@@ -727,9 +724,47 @@ export async function saveFacts(
 export async function saveFactEmbeddings(
   updates: { factId: string; embedding: number[] }[],
 ): Promise<void> {
+  await updateEmbeddings("facts", updates.map((u) => ({ id: u.factId, embedding: u.embedding })));
+}
+
+/**
+ * Writes many vectors in one statement per group.
+ *
+ * A row-at-a-time loop is a network round trip per vector, and the database is
+ * a region away from the function: 300 facts cost roughly a minute of latency
+ * and nothing else, which is most of why the embed step used to exceed the
+ * platform's execution limit. A single `UPDATE … FROM (VALUES …)` writes the
+ * whole slice in one trip.
+ *
+ * Groups are small because a 768-float vector literal is ~9 KB of text — 50 at
+ * a time keeps one statement under half a megabyte.
+ */
+const EMBEDDING_UPDATE_GROUP = 50;
+
+async function updateEmbeddings(
+  table: "facts" | "chunks",
+  updates: { id: string; embedding: number[] }[],
+): Promise<void> {
+  if (updates.length === 0) return;
+
   const db = getDb();
-  for (const { factId, embedding } of updates) {
-    await db.update(facts).set({ embedding }).where(eq(facts.id, factId));
+  const target = table === "facts" ? sql`facts` : sql`chunks`;
+
+  for (let i = 0; i < updates.length; i += EMBEDDING_UPDATE_GROUP) {
+    const group = updates.slice(i, i + EMBEDDING_UPDATE_GROUP);
+    // pgvector's text form is a JSON array, so the driver's own serialisation
+    // of number[] is already the literal Postgres wants.
+    const rows = sql.join(
+      group.map((u) => sql`(${u.id}::uuid, ${JSON.stringify(u.embedding)}::vector)`),
+      sql`, `,
+    );
+
+    await db.execute(sql`
+      update ${target} as t
+      set embedding = v.embedding
+      from (values ${rows}) as v(id, embedding)
+      where t.id = v.id
+    `);
   }
 }
 

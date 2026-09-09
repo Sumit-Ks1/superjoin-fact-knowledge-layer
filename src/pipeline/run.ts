@@ -524,24 +524,40 @@ async function runEmbedBatchInner(
   return { facts: rows.length, processed: rows.length, skipped: false };
 }
 
-/** Chunk embeddings, for passage retrieval. Best effort; never fails a run. */
-export async function runEmbedChunks(documentId: string, limit: number): Promise<number> {
+/**
+ * Chunk embeddings, for passage retrieval. Best effort; never fails a run.
+ *
+ * Sliced like every other stage, and for the same reason: a single call over
+ * every chunk in a long filing is one unit of work the platform's execution
+ * limit will not accommodate. `orderBy` is what makes the offset meaningful —
+ * without it Postgres may return a different window each time and the loop
+ * would re-embed some chunks and never reach others.
+ */
+export async function runEmbedChunks(
+  documentId: string,
+  offset: number,
+  limit: number,
+): Promise<{ processed: number; skipped: boolean }> {
   const db = getDb();
   const rows = await db
     .select({ id: chunksTable.id, text: chunksTable.text })
     .from(chunksTable)
     .where(eq(chunksTable.documentId, documentId))
-    .limit(limit);
+    .orderBy(chunksTable.id)
+    .limit(limit)
+    .offset(offset);
 
-  if (rows.length === 0) return 0;
+  if (rows.length === 0) return { processed: 0, skipped: false };
 
   const result = await embed(rows.map((c) => c.text.slice(0, 6000)));
-  if (!result.ok) return 0;
+  // Chunk vectors are a convenience for reading passages back, so an exhausted
+  // quota stops the loop rather than retrying it batch after batch.
+  if (!result.ok) return { processed: 0, skipped: true };
 
   await saveChunkEmbeddings(
     rows.map((row, k) => ({ chunkId: row.id, embedding: result.vectors[k] })),
   );
-  return rows.length;
+  return { processed: rows.length, skipped: false };
 }
 
 /* ── link ─────────────────────────────────────────────────────────────────── */
@@ -823,11 +839,21 @@ export async function runAll(documentId: string, corpusId: string): Promise<void
     await markStage(documentId, "extract", "done");
 
     const embedBatch = Math.max(1, env.embedFactBatch);
+    let embedSkipped = false;
     for (let offset = 0; ; offset += embedBatch) {
       const out = await runEmbedBatch(documentId, offset, embedBatch);
       if (out.gone || out.skipped || out.processed === 0) {
+        embedSkipped = out.skipped;
         if (!out.skipped) await markStage(documentId, "normalize", "done");
         break;
+      }
+    }
+
+    if (!embedSkipped) {
+      const chunkEmbedBatch = Math.max(1, env.embedChunkBatch);
+      for (let offset = 0; ; offset += chunkEmbedBatch) {
+        const out = await runEmbedChunks(documentId, offset, chunkEmbedBatch);
+        if (out.skipped || out.processed === 0) break;
       }
     }
 

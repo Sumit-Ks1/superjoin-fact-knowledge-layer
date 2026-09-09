@@ -121,8 +121,21 @@ export const env = {
   get extractChunkBatch() {
     return num("EXTRACT_CHUNK_BATCH", 8);
   },
+  /*
+   * Facts embedded per invocation.
+   *
+   * Sized to the provider's quota window, not to the time limit. Gemini's free
+   * embedding tier counts *input texts*, not API calls, at 100 a minute — so a
+   * batch of 100 is one window, and a step that overruns it waits once for the
+   * reset instead of failing the whole slice. 300 meant three windows in one
+   * step and a rate limit that no amount of backoff could clear in time.
+   */
   get embedFactBatch() {
-    return num("EMBED_FACT_BATCH", 300);
+    return num("EMBED_FACT_BATCH", 100);
+  },
+  /** Chunks embedded per invocation. Lower than facts: the texts are longer. */
+  get embedChunkBatch() {
+    return num("EMBED_CHUNK_BATCH", 50);
   },
 
   get llmMaxConcurrency() {
