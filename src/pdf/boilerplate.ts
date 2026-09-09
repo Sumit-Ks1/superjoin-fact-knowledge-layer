@@ -30,6 +30,33 @@ export type BoilerplateMatcher = {
   patterns: string[];
 };
 
+/**
+ * Rebuilds a matcher from patterns alone.
+ *
+ * Boilerplate is learned from the whole document, but pages are parsed in
+ * batches to stay inside the platform's per-invocation time limit — and a
+ * closure cannot cross that boundary. The patterns are plain strings, so they
+ * travel as step output and the matcher is reconstructed on the other side.
+ */
+export function boilerplateFromPatterns(patterns: string[]): BoilerplateMatcher {
+  const repeated = new Set(patterns);
+  return {
+    patterns,
+    isBoilerplate(line: Line, pageHeight: number) {
+      const topEdge = pageHeight * (1 - BAND_RATIO);
+      const bottomEdge = pageHeight * BAND_RATIO;
+      const inBand = line.y0 >= topEdge || line.y1 <= bottomEdge;
+      if (!inBand) return false;
+
+      const bare = line.text.trim();
+      if (/^[ivxlcdm]{1,7}$|^\d{1,4}$/i.test(bare)) return true;
+
+      const band = line.y0 >= topEdge ? "top" : "bottom";
+      return repeated.has(`${band}:${normalizeForRepeat(line.text)}`);
+    },
+  };
+}
+
 export function detectBoilerplate(
   pages: { pageNo: number; height: number; lines: Line[] }[],
 ): BoilerplateMatcher {

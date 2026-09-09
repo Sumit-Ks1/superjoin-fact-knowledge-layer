@@ -22,10 +22,15 @@
  * subject moves into the row.
  */
 
-import type { BBox, FactKind, PeriodKind, UnitInfo, ValueModifier } from "@/db/schema";
+import type {
+  BBox,
+  FactKind,
+  PeriodKind,
+  TableCell,
+  UnitInfo,
+  ValueModifier,
+} from "@/db/schema";
 import { stableHash } from "@/lib/hash";
-import type { ParsedTable } from "@/pdf/parse";
-
 import {
   looksTemporal,
   parsePeriod,
@@ -34,6 +39,31 @@ import {
 } from "../normalize/period";
 import { canonicalize, tidy } from "../normalize/text";
 import { normalizeValue } from "../normalize/value";
+
+/**
+ * What this function needs from a grid, and nothing more.
+ *
+ * Structural rather than tied to the parser's own type, because a grid reaches
+ * here two ways: straight from the parser during a fresh parse, and read back
+ * from the database during extraction. The database row carries the reconstructed
+ * cells but not the parser's internal bookkeeping — line offsets, review notes —
+ * and requiring those would force a re-parse of work already done.
+ */
+export type ExtractableTable = {
+  kind: "grid" | "chart";
+  pageNo: number;
+  rowCount: number;
+  colCount: number;
+  cells: TableCell[];
+  colHeaderPaths: string[][];
+  headerRowCount: number;
+  rowLabelCols: number;
+  caption: string | null;
+  unitHint: string | null;
+  confidence: number;
+  needsReview: boolean;
+  bbox: BBox;
+};
 
 /** A fact before it has a database identity. */
 export type FactDraft = {
@@ -202,7 +232,7 @@ function buildKeys(
  * dropped and start distinguishing two rows that would otherwise collide.
  */
 export function extractTableFacts(
-  table: ParsedTable,
+  table: ExtractableTable,
   context: TableExtractionContext,
 ): TableExtractionResult {
   const facts: FactDraft[] = [];

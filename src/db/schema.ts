@@ -232,8 +232,19 @@ export const docTables = pgTable(
      * and what confines the arithmetic check to one grid.
      */
     sourceKey: text("source_key").notNull(),
+    /**
+     * `chart` marks a region that reconstructs as a grid but is not one.
+     * Persisted so extraction can read tables back from here instead of
+     * re-parsing the PDF, which is what kept a second full parse on the
+     * critical path and blew the serverless time limit.
+     */
+    kind: text("kind").$type<"grid" | "chart">().notNull().default("grid"),
     pageStart: integer("page_start").notNull(),
     pageEnd: integer("page_end").notNull(),
+    /** Rectangle of the whole grid, for evidence and for the source key. */
+    bbox: jsonb("bbox").$type<BBox>(),
+    /** Leading rows that describe the columns rather than carry data. */
+    headerRowCount: integer("header_row_count").notNull().default(0),
     caption: text("caption"),
     /**
      * Scale/currency hint harvested from the nearest caption ("(in ₹ million)",

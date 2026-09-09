@@ -64,7 +64,7 @@ PDF → geometry → lines → tables/blocks → chunks → facts → normalised
 | **Normalise** | [`src/pipeline/normalize/`](src/pipeline/normalize/) | Units, periods, canonical text |
 | **Find pairs** | [`src/pipeline/link/candidates.ts`](src/pipeline/link/candidates.ts) | Four channels, incl. the arithmetic self-audit |
 | **Judge pairs** | [`src/pipeline/link/adjudicate.ts`](src/pipeline/link/adjudicate.ts) | The verdicts, and the reasoning behind each |
-| **Orchestrate** | [`src/pipeline/run.ts`](src/pipeline/run.ts), [`src/inngest/functions.ts`](src/inngest/functions.ts) | Durable, resumable steps |
+| **Orchestrate** | [`src/pipeline/run.ts`](src/pipeline/run.ts), [`src/inngest/functions.ts`](src/inngest/functions.ts) | Durable, resumable steps, sliced to fit a 60s function limit |
 
 ### Why table reconstruction is the hard part
 
@@ -118,6 +118,8 @@ arithmetic channel instead. This one rule removed most of the false positives.
 | Inngest | BullMQ | A queue needs a process that stays alive; Vercel has none. |
 | pgvector in Postgres | Dedicated vector DB | One database, so a similarity search and a SQL filter are one query. |
 | Browser → Storage upload | Upload via API | Vercel caps bodies at 4.5 MB; the sample annual report is 6.7 MB. |
+| Batched stages | One pass per document | Free-tier functions stop at 60s. Slices cost seam effects at page boundaries; one pass cannot finish at all. |
+| Tables read back from Postgres | Re-parsing at extract time | Re-parsing put a second full parse on the critical path and was the main cause of timeouts. |
 | Open `qualifiers` JSONB | Fixed columns | A document can introduce a new dimension without a migration. |
 | Official SDKs | LangChain | Removed a HIGH SSRF advisory in a transitive dependency; smaller bundle; direct control over retry and fallback. |
 | Refuse rather than guess | Best-effort answers | Guessing a missing scale invents a contradiction a million times too large. |

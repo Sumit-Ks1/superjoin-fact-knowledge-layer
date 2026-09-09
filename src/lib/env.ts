@@ -101,6 +101,27 @@ export const env = {
   },
 
   /* Pipeline tuning */
+
+  /*
+   * Batch sizes, in units of work per serverless invocation.
+   *
+   * These exist because the platform, not the algorithm, sets the ceiling.
+   * Vercel's free tier stops a function after 60 seconds, and a 100-page
+   * filing takes well over that to parse in one go — so every stage runs in
+   * slices small enough to finish, with Inngest carrying the state between
+   * them. Lower them if you see FUNCTION_INVOCATION_TIMEOUT; raise them on a
+   * plan with a longer limit.
+   */
+  get parsePageBatch() {
+    return num("PARSE_PAGE_BATCH", 20);
+  },
+  get extractChunkBatch() {
+    return num("EXTRACT_CHUNK_BATCH", 8);
+  },
+  get embedFactBatch() {
+    return num("EMBED_FACT_BATCH", 300);
+  },
+
   get llmMaxConcurrency() {
     return num("LLM_MAX_CONCURRENCY", 3);
   },

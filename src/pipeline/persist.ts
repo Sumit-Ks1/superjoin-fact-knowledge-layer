@@ -174,6 +174,137 @@ export async function recordIssues(
   );
 }
 
+/* ── batch lifecycle ──────────────────────────────────────────── */
+
+/**
+ * Removes everything derived from a document, so a run starts clean.
+ *
+ * Called once, before the first batch. The writes themselves append, because
+ * the pipeline processes a long document in slices to stay inside the
+ * platform's per-invocation time limit — and a delete inside those writes
+ * would mean each slice discarded the one before it.
+ */
+export async function clearDerived(documentId: string): Promise<void> {
+  const db = getDb();
+  // facts first: evidence and relations cascade from them.
+  await db.delete(facts).where(eq(facts.documentId, documentId));
+  await db.delete(chunks).where(eq(chunks.documentId, documentId));
+  await db.delete(docTables).where(eq(docTables.documentId, documentId));
+  await db.delete(blocks).where(eq(blocks.documentId, documentId));
+  await db.delete(pages).where(eq(pages.documentId, documentId));
+  await db.delete(issues).where(eq(issues.documentId, documentId));
+}
+
+/* ── read-back ────────────────────────────────────────────────── */
+
+/** A stored grid, in the shape the table extractor expects. */
+export type StoredTable = {
+  id: string;
+  kind: "grid" | "chart";
+  pageNo: number;
+  rowCount: number;
+  colCount: number;
+  cells: TableCell[];
+  colHeaderPaths: string[][];
+  headerRowCount: number;
+  rowLabelCols: number;
+  caption: string | null;
+  unitHint: string | null;
+  confidence: number;
+  needsReview: boolean;
+  bbox: BBox;
+  sourceKey: string;
+};
+
+/**
+ * Reads a document's grids back for extraction.
+ *
+ * This is why the three extra columns exist. Without them the extract stage had
+ * to re-download the PDF and rebuild every grid from geometry — a second full
+ * parse, on the critical path, for work already done and already stored.
+ */
+export async function loadTables(documentId: string): Promise<StoredTable[]> {
+  const db = getDb();
+  const rows = await db
+    .select()
+    .from(docTables)
+    .where(eq(docTables.documentId, documentId))
+    .orderBy(docTables.pageStart);
+
+  return rows.map((row) => ({
+    id: row.id,
+    kind: row.kind,
+    pageNo: row.pageStart,
+    rowCount: row.rowCount,
+    colCount: row.colCount,
+    cells: row.cells,
+    colHeaderPaths: row.colHeaderPaths,
+    headerRowCount: row.headerRowCount,
+    rowLabelCols: row.rowLabelCols,
+    caption: row.caption,
+    unitHint: row.unitHint,
+    confidence: row.confidence,
+    needsReview: row.needsReview,
+    bbox: row.bbox ?? { x0: 0, y0: 0, x1: 0, y1: 0 },
+    sourceKey: row.sourceKey,
+  }));
+}
+
+/** One page of narrative chunks, for batched prose extraction. */
+export async function loadNarrativeChunks(
+  documentId: string,
+  offset: number,
+  limit: number,
+): Promise<
+  { id: string; ordinal: number; text: string; breadcrumb: string; pageStart: number; bboxUnion: BBox | null }[]
+> {
+  const db = getDb();
+  return db
+    .select({
+      id: chunks.id,
+      ordinal: chunks.ordinal,
+      text: chunks.text,
+      breadcrumb: chunks.breadcrumb,
+      pageStart: chunks.pageStart,
+      bboxUnion: chunks.bboxUnion,
+    })
+    .from(chunks)
+    .where(
+      and(
+        eq(chunks.documentId, documentId),
+        eq(chunks.kind, "narrative"),
+        eq(chunks.factBearing, true),
+      ),
+    )
+    .orderBy(chunks.ordinal)
+    .limit(limit)
+    .offset(offset);
+}
+
+export async function countNarrativeChunks(documentId: string): Promise<number> {
+  const db = getDb();
+  const [row] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(chunks)
+    .where(
+      and(
+        eq(chunks.documentId, documentId),
+        eq(chunks.kind, "narrative"),
+        eq(chunks.factBearing, true),
+      ),
+    );
+  return row?.n ?? 0;
+}
+
+export async function countFacts(documentId: string): Promise<number> {
+  const db = getDb();
+  const [row] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(facts)
+    .where(eq(facts.documentId, documentId));
+  return row?.n ?? 0;
+}
+
 /* ── layout ───────────────────────────────────────────────────────────────── */
 
 export type SavedLayout = {
@@ -194,10 +325,10 @@ export async function saveLayout(
 ): Promise<SavedLayout> {
   const db = getDb();
 
-  await db.delete(pages).where(eq(pages.documentId, documentId));
-  await db.delete(blocks).where(eq(blocks.documentId, documentId));
-  await db.delete(docTables).where(eq(docTables.documentId, documentId));
-
+  /*
+   * Appends. Clearing belongs to `clearDerived`, called once before the first
+   * batch — a delete here would mean each page batch erased the one before it.
+   */
   if (results.length > 0) {
     await db.insert(pages).values(
       results.map((r) => ({
@@ -225,8 +356,11 @@ export async function saveLayout(
         .values({
           documentId,
           sourceKey,
+          kind: table.kind,
           pageStart: table.pageNo,
           pageEnd: table.pageNo,
+          bbox: table.bbox,
+          headerRowCount: table.headerRowCount,
           caption: table.caption,
           unitHint: table.unitHint,
           rowCount: table.rowCount,
@@ -269,8 +403,8 @@ export async function saveChunks(
   tableIds: (string | null)[],
 ): Promise<Map<number, string>> {
   const db = getDb();
-  await db.delete(chunks).where(eq(chunks.documentId, documentId));
 
+  // Appends; see `clearDerived`.
   const idByOrdinal = new Map<number, string>();
   if (drafts.length === 0) return idByOrdinal;
 
@@ -431,7 +565,9 @@ export async function saveFacts(
   tableIdBySourceKey: Map<string, string>,
 ): Promise<SavedFact[]> {
   const db = getDb();
-  await db.delete(facts).where(eq(facts.documentId, documentId));
+
+  // Appends. Extraction runs in batches, and clearing here would leave only
+  // the last batch's facts.
   if (drafts.length === 0) return [];
 
   // Vocabularies first, so every fact can carry its resolved ids.

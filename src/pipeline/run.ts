@@ -1,32 +1,33 @@
 /**
- * The pipeline, as stages Inngest can call one at a time.
+ * The pipeline, as slices small enough to finish.
  *
- * Each stage is a pure-ish function of the database: it reads what earlier
- * stages wrote, does its work, writes its own rows, and records progress. That
- * shape is what makes retries safe and lets a 300-page document run inside a
- * platform that kills any single function after a minute.
+ * Every stage reads what earlier stages wrote, does a bounded amount of work,
+ * writes its own rows, and records progress. That shape makes retries safe —
+ * and, more importantly, it is what lets a 300-page filing be processed on a
+ * platform that stops any single function after sixty seconds.
  *
- * The split points are chosen around cost, not around code structure:
+ * The split points are set by that limit, not by the shape of the code:
  *
- *   parse    Deterministic and fast (~2ms/page). Also establishes what the
- *            document is and whose figures it reports, which every later stage
- *            depends on.
- *   extract  Table facts are deterministic and run in the same step. Narrative
- *            facts need a model per chunk, so they are batched separately and
- *            each batch is independently retryable.
- *   embed    Cheap per call, slow in bulk, and entirely skippable — without it
- *            the exact-key channels still work.
- *   link     Corpus-wide, not per-document: a fact only becomes interesting
- *            when compared with one from somewhere else.
+ *   prepare   Samples the document to learn its running headers and its
+ *             subject, then clears any previous run. Cheap regardless of size.
+ *   parse     One page range at a time. Layout and chunks for those pages only.
+ *   extract   Tables read back from the database — never re-parsed. Prose is
+ *             batched separately, because each passage costs a model call.
+ *   embed     Batched, and entirely skippable; without it the exact-key and
+ *             arithmetic channels still work.
+ *   link      Corpus-wide, not per-document: a fact only becomes interesting
+ *             when compared with one from somewhere else.
+ *
+ * Every stage returns `gone: true` rather than throwing if the document was
+ * deleted underneath it. That is a user action, not a fault.
  */
 
-import { eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 
 import { embed } from "@/ai/provider";
 import { getDb } from "@/db/client";
 import {
   chunks as chunksTable,
-  docTables as docTablesTable,
   documents,
   facts as factsTable,
   type IssueKind,
@@ -34,6 +35,7 @@ import {
 import { env } from "@/lib/env";
 import { log } from "@/lib/logger";
 import { downloadDocument } from "@/lib/supabase";
+import { boilerplateFromPatterns } from "@/pdf/boilerplate";
 import { extractGeometry, probeDocument } from "@/pdf/extract";
 import { detectBoilerplate, parsePages } from "@/pdf/parse";
 
@@ -51,6 +53,9 @@ import {
 } from "./link/candidates";
 import { parsePeriod, type FiscalCalendar } from "./normalize/period";
 import {
+  clearDerived,
+  loadNarrativeChunks,
+  loadTables,
   markStage,
   recordIssues,
   saveChunkEmbeddings,
@@ -63,47 +68,34 @@ import {
   type RelationRow,
 } from "./persist";
 
-/* ── parse ────────────────────────────────────────────────────────────────── */
+/* ── prepare ──────────────────────────────────────────────────────────────── */
 
-export type ParseOutcome = {
-  pageCount: number;
-  tableCount: number;
-  chunkCount: number;
-  subject: string;
+export type PrepareOutcome = {
   usable: boolean;
   detail: string;
-  /** The document was deleted while the pipeline was running. Not an error. */
+  pageCount: number;
+  subject: string;
+  /** Plain strings, so the matcher can be rebuilt inside each later batch. */
+  boilerplate: string[];
   gone?: boolean;
 };
 
 /**
- * Parses a document end to end and writes its layout, profile and chunks.
+ * Establishes what the page batches need, without parsing the whole file.
  *
- * Parse and chunk are one step because chunking needs the parsed pages, and
- * re-parsing to get them back would cost more than doing both at once.
+ * Boilerplate and the document profile are both document-wide questions, and
+ * both are answerable from a sample: a running header repeats by definition,
+ * and a document names itself on its opening pages. Sampling keeps this step
+ * far inside the time limit even for a very long filing.
  */
-export async function runParse(documentId: string): Promise<ParseOutcome> {
+export async function runPrepare(documentId: string): Promise<PrepareOutcome> {
   const db = getDb();
   await markStage(documentId, "parse", "running");
 
   const [doc] = await db.select().from(documents).where(eq(documents.id, documentId)).limit(1);
-
-  /*
-   * The document can be deleted while its pipeline is in flight. That is a
-   * user action, not a fault: the run ends quietly rather than retrying three
-   * times against a row that will never come back.
-   */
   if (!doc) {
-    log.info("document deleted mid-run; stopping", { documentId, stage: "parse" });
-    return {
-      pageCount: 0,
-      tableCount: 0,
-      chunkCount: 0,
-      subject: "",
-      usable: false,
-      gone: true,
-      detail: "The document was deleted before parsing finished.",
-    };
+    log.info("document deleted mid-run; stopping", { documentId, stage: "prepare" });
+    return { usable: false, gone: true, detail: "", pageCount: 0, subject: "", boilerplate: [] };
   }
 
   const bytes = await downloadDocument(doc.storagePath);
@@ -116,35 +108,35 @@ export async function runParse(documentId: string): Promise<ParseOutcome> {
     await markStage(documentId, "parse", "failed", { error: probe.detail });
     await setDocumentStatus(documentId, "failed", probe.detail);
     return {
-      pageCount: probe.pageCount,
-      tableCount: 0,
-      chunkCount: 0,
-      subject: doc.filename,
       usable: false,
       detail: probe.detail,
+      pageCount: probe.pageCount,
+      subject: "",
+      boilerplate: [],
     };
   }
 
-  const geometry = await extractGeometry(bytes);
+  // A re-run replaces everything. The batches below only append.
+  await clearDerived(documentId);
 
-  // Boilerplate needs a document-wide view, so the pages are parsed twice: once
-  // to learn the running headers, once to strip them.
-  const firstPass = parsePages(geometry.pages);
+  /*
+   * Sample rather than read everything. Boilerplate needs enough pages to see
+   * a repeat — the detector wants three — and the profile needs the opening
+   * pages. Neither needs page 250.
+   */
+  const sampleTo = Math.min(probe.pageCount, 24);
+  const sample = await extractGeometry(bytes, { fromPage: 1, toPage: sampleTo });
+  const sampled = parsePages(sample.pages);
   const boilerplate = detectBoilerplate(
-    firstPass.results.map((r) => ({
-      pageNo: r.page.pageNo,
-      height: r.page.height,
-      lines: r.lines,
-    })),
+    sampled.results.map((r) => ({ pageNo: r.page.pageNo, height: r.page.height, lines: r.lines })),
   );
-  const { results } = parsePages(geometry.pages, { boilerplate });
 
-  const bodyText = results.flatMap((r) => r.blocks.map((b) => b.text)).join("\n");
+  const bodyText = sampled.results.flatMap((r) => r.blocks.map((b) => b.text)).join("\n");
   const prominent = [
-    ...results
+    ...sampled.results
       .filter((r) => r.page.pageNo <= 1)
       .flatMap((r) => r.blocks.filter((b) => b.kind === "heading").map((b) => b.text)),
-    ...firstPass.results.flatMap((r) =>
+    ...sampled.results.flatMap((r) =>
       r.lines.filter((l) => boilerplate.isBoilerplate(l, r.page.height)).map((l) => l.text),
     ),
   ];
@@ -155,25 +147,10 @@ export async function runParse(documentId: string): Promise<ParseOutcome> {
     prominent,
   );
 
-  const { tableIdBySourceKey } = await saveLayout(documentId, results);
-
-  const { chunks: chunkDrafts, tables: chunkTables } = buildChunks(results);
-
-  // Chunk → table, via the same source key the extractor uses. Positional
-  // matching would break the moment a table failed to persist.
-  const tableIds = chunkDrafts.map((c) => {
-    if (c.tableIndex === null) return null;
-    const table = chunkTables[c.tableIndex]?.table;
-    if (!table) return null;
-    const key = `p${table.pageNo}:${Math.round(table.bbox.x0)},${Math.round(table.bbox.y0)}`;
-    return tableIdBySourceKey.get(key) ?? null;
-  });
-  await saveChunks(documentId, chunkDrafts, tableIds);
-
   await db
     .update(documents)
     .set({
-      pageCount: geometry.pageCount,
+      pageCount: probe.pageCount,
       fiscalYearEnd: profile.fiscalCalendar
         ? `${String(profile.fiscalCalendar.endMonth + 1).padStart(2, "0")}-${String(profile.fiscalCalendar.endDay).padStart(2, "0")}`
         : null,
@@ -182,179 +159,133 @@ export async function runParse(documentId: string): Promise<ParseOutcome> {
     })
     .where(eq(documents.id, documentId));
 
-  const lowConfidencePages = results.filter((r) => r.page.layoutConfidence < 0.5).length;
-  if (lowConfidencePages > 0) {
-    await recordIssues(documentId, doc.corpusId, [
-      {
-        kind: "chart_region_unreadable",
-        severity: "info",
-        detail: `${lowConfidencePages} page(s) have low layout confidence — typically infographic or chart pages. Facts from them are quarantined.`,
-      },
-    ]);
-  }
-
-  const tableCount = results.reduce((n, r) => n + r.tables.length, 0);
-  await markStage(documentId, "parse", "done", {
-    metrics: {
-      pages: geometry.pageCount,
-      tables: tableCount,
-      subject: profile.subject,
-      subjectSource: profile.source,
-    },
-  });
-  await markStage(documentId, "chunk", "done", {
-    metrics: { chunks: chunkDrafts.length },
-  });
-
   return {
-    pageCount: geometry.pageCount,
-    tableCount,
-    chunkCount: chunkDrafts.length,
-    subject: profile.subject,
     usable: true,
     detail: probe.detail,
+    pageCount: probe.pageCount,
+    subject: profile.subject,
+    boilerplate: boilerplate.patterns,
+  };
+}
+
+/* ── parse, one page range at a time ──────────────────────────────────────── */
+
+export type ParseBatchOutcome = {
+  tables: number;
+  chunks: number;
+  lowConfidencePages: number;
+  gone?: boolean;
+};
+
+/**
+ * Parses one slice of pages and stores its layout and chunks.
+ *
+ * The slice is what makes this survivable: a hundred-page filing takes minutes
+ * to parse in one go, twenty pages take seconds, and Inngest keeps the state
+ * between slices.
+ *
+ * The cost is at the seams. A paragraph spanning a boundary becomes two chunks
+ * instead of one — about one paragraph per slice. No figure is lost; at worst a
+ * sentence that qualifies one sits in the neighbouring chunk.
+ */
+export async function runParseBatch(
+  documentId: string,
+  fromPage: number,
+  toPage: number,
+  boilerplatePatterns: string[],
+  chunkOrdinalOffset: number,
+): Promise<ParseBatchOutcome> {
+  const db = getDb();
+
+  const [doc] = await db.select().from(documents).where(eq(documents.id, documentId)).limit(1);
+  if (!doc) {
+    log.info("document deleted mid-run; stopping", { documentId, stage: "parse" });
+    return { tables: 0, chunks: 0, lowConfidencePages: 0, gone: true };
+  }
+
+  const bytes = await downloadDocument(doc.storagePath);
+  const geometry = await extractGeometry(bytes, { fromPage, toPage });
+  const { results } = parsePages(geometry.pages, {
+    boilerplate: boilerplateFromPatterns(boilerplatePatterns),
+  });
+
+  const { tableIdBySourceKey } = await saveLayout(documentId, results);
+
+  const { chunks: drafts, tables: chunkTables } = buildChunks(results);
+  const offsetDrafts = drafts.map((draft) => ({
+    ...draft,
+    ordinal: draft.ordinal + chunkOrdinalOffset,
+  }));
+
+  const tableIds = offsetDrafts.map((chunk) => {
+    if (chunk.tableIndex === null) return null;
+    const table = chunkTables[chunk.tableIndex]?.table;
+    if (!table) return null;
+    const key = `p${table.pageNo}:${Math.round(table.bbox.x0)},${Math.round(table.bbox.y0)}`;
+    return tableIdBySourceKey.get(key) ?? null;
+  });
+  await saveChunks(documentId, offsetDrafts, tableIds);
+
+  return {
+    tables: results.reduce((n, r) => n + r.tables.length, 0),
+    chunks: offsetDrafts.length,
+    lowConfidencePages: results.filter((r) => r.page.layoutConfidence < 0.5).length,
   };
 }
 
 /* ── extract ──────────────────────────────────────────────────────────────── */
 
-/** Re-derives the parse so extraction can read grids the database flattens. */
-async function reparse(documentId: string) {
-  const db = getDb();
-  const [doc] = await db.select().from(documents).where(eq(documents.id, documentId)).limit(1);
-  if (!doc) return null;
-
-  const bytes = await downloadDocument(doc.storagePath);
-  const geometry = await extractGeometry(bytes);
-  const firstPass = parsePages(geometry.pages);
-  const boilerplate = detectBoilerplate(
-    firstPass.results.map((r) => ({ pageNo: r.page.pageNo, height: r.page.height, lines: r.lines })),
-  );
-  const { results } = parsePages(geometry.pages, { boilerplate });
-
-  const fiscalCalendar: FiscalCalendar = doc.fiscalYearEnd
-    ? {
-        endMonth: Number(doc.fiscalYearEnd.slice(0, 2)) - 1,
-        endDay: Number(doc.fiscalYearEnd.slice(3, 5)),
-      }
-    : null;
-
-  return { doc, results, fiscalCalendar };
+function fiscalCalendarOf(fiscalYearEnd: string | null): FiscalCalendar {
+  if (!fiscalYearEnd) return null;
+  return {
+    endMonth: Number(fiscalYearEnd.slice(0, 2)) - 1,
+    endDay: Number(fiscalYearEnd.slice(3, 5)),
+  };
 }
 
-export type ExtractOutcome = {
-  tableFacts: number;
-  narrativeFacts: number;
-  rejected: number;
-  /** The document was deleted while the pipeline was running. Not an error. */
-  gone?: boolean;
-};
+export type ExtractOutcome = { facts: number; gone?: boolean };
 
 /**
- * Extracts every fact in a document.
+ * Reads every stored grid into facts.
  *
- * Table facts come first and always; narrative facts are attempted only if a
- * model is configured, and a failure there costs prose facts rather than the
- * document.
+ * Works from the reconstructed cells the parse stage already saved. This used
+ * to re-download the PDF and rebuild every grid from geometry — a second full
+ * parse of work already done, and the single biggest reason the pipeline could
+ * not finish inside one invocation.
  */
-export async function runExtract(
-  documentId: string,
-  options: { narrative?: boolean } = {},
-): Promise<ExtractOutcome> {
+export async function runExtractTables(documentId: string): Promise<ExtractOutcome> {
   await markStage(documentId, "extract", "running");
+  const db = getDb();
 
-  const reparsed = await reparse(documentId);
-  if (!reparsed) {
-    log.info("document deleted mid-run; stopping", { documentId, stage: "extract" });
-    return { tableFacts: 0, narrativeFacts: 0, rejected: 0, gone: true };
-  }
-  const { doc, results, fiscalCalendar } = reparsed;
+  const [doc] = await db.select().from(documents).where(eq(documents.id, documentId)).limit(1);
+  if (!doc) return { facts: 0, gone: true };
 
+  const tables = await loadTables(documentId);
   const subject = doc.docType || doc.filename.replace(/\.pdf$/i, "");
+  const fiscalCalendar = fiscalCalendarOf(doc.fiscalYearEnd);
+
   const drafts: FactDraft[] = [];
   const issueRows: { kind: IssueKind; detail: string; pageNo?: number }[] = [];
 
-  for (const result of results) {
-    for (const table of result.tables) {
-      const breadcrumb =
-        result.blocks.find((b) => b.tableIndex !== null && b.pageNo === table.pageNo)?.headingPath
-          .join(" ▸ ") ?? "";
-
-      const out = extractTableFacts(table, {
-        documentSubject: subject,
-        fiscalCalendar,
-        breadcrumb,
-      });
-      drafts.push(...out.facts);
-      for (const issue of out.issues) {
-        issueRows.push({ kind: issue.kind, detail: issue.detail, pageNo: issue.pageNo });
-      }
+  for (const table of tables) {
+    const out = extractTableFacts(table, {
+      documentSubject: subject,
+      fiscalCalendar,
+      breadcrumb: table.caption ?? "",
+    });
+    drafts.push(...out.facts);
+    for (const issue of out.issues) {
+      issueRows.push({ kind: issue.kind, detail: issue.detail, pageNo: issue.pageNo });
     }
   }
 
-  const tableFacts = drafts.length;
-  let rejected = 0;
-
-  if (options.narrative !== false) {
-    const { chunks: chunkDrafts } = buildChunks(results);
-    const narrativeChunks = chunkDrafts.filter((c) => c.kind === "narrative" && c.factBearing);
-
-    for (const chunk of narrativeChunks) {
-      const out = await extractNarrativeFacts(chunk.text, {
-        documentSubject: subject,
-        fiscalCalendar,
-        breadcrumb: chunk.breadcrumb,
-        pageStart: chunk.pageStart,
-        bbox: chunk.bboxUnion,
-        sourceKey: `chunk:${chunk.ordinal}`,
-      });
-      if (out.skipped) break; // No model configured; stop rather than loop.
-      drafts.push(...out.facts);
-      rejected += out.rejected.length;
-
-      for (const r of out.rejected.slice(0, 2)) {
-        issueRows.push({
-          kind: "quote_verification_failed",
-          pageNo: chunk.pageStart,
-          detail: `A proposed fact was discarded: ${r.reason}. Claim: "${r.claim.predicate}" = ${r.claim.value ?? "—"}.`,
-        });
-      }
-    }
-  }
-
-  // Chunk ids are needed to attach facts to the text they came from.
-  const db = getDb();
-  const chunkRows = await db
-    .select({ id: chunksTable.id, ordinal: chunksTable.ordinal })
-    .from(chunksTable)
-    .where(eq(chunksTable.documentId, documentId));
-  const chunkIdByOrdinal = new Map(chunkRows.map((r) => [r.ordinal, r.id]));
-
-  // Evidence points at a cell, so each fact's source key must resolve to the
-  // stored table row.
-  const tableRows = await db
-    .select({ id: docTablesTable.id, sourceKey: docTablesTable.sourceKey })
-    .from(docTablesTable)
-    .where(eq(docTablesTable.documentId, documentId));
-  const tableIdBySourceKey = new Map(tableRows.map((r) => [r.sourceKey, r.id]));
-
-  await saveFacts(
-    documentId,
-    doc.corpusId,
-    drafts,
-    chunkIdByOrdinal,
-    (draft) => {
-      const match = draft.sourceKey.match(/^chunk:(\d+)$/);
-      return match ? Number(match[1]) : null;
-    },
-    tableIdBySourceKey,
-  );
+  const tableIdBySourceKey = new Map(tables.map((t) => [t.sourceKey, t.id]));
+  await saveFacts(documentId, doc.corpusId, drafts, new Map(), () => null, tableIdBySourceKey);
 
   if (issueRows.length > 0) {
-    // Deduplicated: one row per distinct message keeps the Quality screen readable.
     const seen = new Set<string>();
-    const unique = issueRows.filter((r) => {
-      const key = `${r.kind}:${r.pageNo}:${r.detail}`;
+    const unique = issueRows.filter((row) => {
+      const key = `${row.kind}:${row.pageNo}:${row.detail}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -362,12 +293,85 @@ export async function runExtract(
     await recordIssues(documentId, doc.corpusId, unique.slice(0, 200));
   }
 
-  const narrativeFacts = drafts.length - tableFacts;
-  await markStage(documentId, "extract", "done", {
-    metrics: { tableFacts, narrativeFacts, rejected },
-  });
+  return { facts: drafts.length };
+}
 
-  return { tableFacts, narrativeFacts, rejected };
+export type NarrativeOutcome = {
+  facts: number;
+  rejected: number;
+  processed: number;
+  skipped: boolean;
+  gone?: boolean;
+};
+
+/**
+ * Extracts prose facts from one slice of chunks.
+ *
+ * Batched because each chunk costs a model call, and a long filing has a couple
+ * of hundred fact-bearing passages. Sequentially that is minutes of wall time —
+ * fine for the pipeline as a whole, impossible for one invocation.
+ */
+export async function runExtractNarrative(
+  documentId: string,
+  offset: number,
+  limit: number,
+): Promise<NarrativeOutcome> {
+  const db = getDb();
+  const [doc] = await db.select().from(documents).where(eq(documents.id, documentId)).limit(1);
+  if (!doc) return { facts: 0, rejected: 0, processed: 0, skipped: false, gone: true };
+
+  const slice = await loadNarrativeChunks(documentId, offset, limit);
+  if (slice.length === 0) return { facts: 0, rejected: 0, processed: 0, skipped: false };
+
+  const subject = doc.docType || doc.filename.replace(/\.pdf$/i, "");
+  const fiscalCalendar = fiscalCalendarOf(doc.fiscalYearEnd);
+
+  const drafts: FactDraft[] = [];
+  const issueRows: { kind: IssueKind; detail: string; pageNo?: number }[] = [];
+  let rejected = 0;
+
+  for (const chunk of slice) {
+    const out = await extractNarrativeFacts(chunk.text, {
+      documentSubject: subject,
+      fiscalCalendar,
+      breadcrumb: chunk.breadcrumb,
+      pageStart: chunk.pageStart,
+      bbox: chunk.bboxUnion,
+      sourceKey: `chunk:${chunk.ordinal}`,
+    });
+
+    // No model configured: stop rather than repeating the same no-op.
+    if (out.skipped) return { facts: 0, rejected: 0, processed: 0, skipped: true };
+
+    drafts.push(...out.facts);
+    rejected += out.rejected.length;
+    for (const item of out.rejected.slice(0, 2)) {
+      issueRows.push({
+        kind: "quote_verification_failed",
+        pageNo: chunk.pageStart,
+        detail: `A proposed fact was discarded: ${item.reason}. Claim: "${item.claim.predicate}".`,
+      });
+    }
+  }
+
+  if (drafts.length > 0) {
+    const chunkIdByOrdinal = new Map(slice.map((c) => [c.ordinal, c.id]));
+    await saveFacts(
+      documentId,
+      doc.corpusId,
+      drafts,
+      chunkIdByOrdinal,
+      (draft) => {
+        const match = draft.sourceKey.match(/^chunk:(\d+)$/);
+        return match ? Number(match[1]) : null;
+      },
+      new Map(),
+    );
+  }
+
+  if (issueRows.length > 0) await recordIssues(documentId, doc.corpusId, issueRows.slice(0, 50));
+
+  return { facts: drafts.length, rejected, processed: slice.length, skipped: false };
 }
 
 /* ── embed ────────────────────────────────────────────────────────────────── */
@@ -387,11 +391,32 @@ function renderFactForEmbedding(row: {
   return parts.join(" · ");
 }
 
-export async function runEmbed(documentId: string): Promise<{ facts: number; chunks: number }> {
-  await markStage(documentId, "normalize", "running");
+export type EmbedOutcome = {
+  facts: number;
+  processed: number;
+  skipped: boolean;
+  detail?: string;
+  gone?: boolean;
+};
+
+/**
+ * Embeds one slice of a document's facts.
+ *
+ * Batched for the same reason as everything else, and skippable for a different
+ * one: similarity is an enhancement. When the provider refuses — an exhausted
+ * free quota, most often — the stage is marked skipped and the pipeline carries
+ * on, because the exact-key, reconciliation and arithmetic channels do not
+ * depend on it.
+ */
+export async function runEmbedBatch(
+  documentId: string,
+  offset: number,
+  limit: number,
+): Promise<EmbedOutcome> {
+  if (offset === 0) await markStage(documentId, "normalize", "running");
   const db = getDb();
 
-  const factRows = await db
+  const rows = await db
     .select({
       id: factsTable.id,
       subjectText: factsTable.subjectText,
@@ -401,47 +426,42 @@ export async function runEmbed(documentId: string): Promise<{ facts: number; chu
       qualifiers: factsTable.qualifiers,
     })
     .from(factsTable)
-    .where(eq(factsTable.documentId, documentId));
+    .where(eq(factsTable.documentId, documentId))
+    .orderBy(factsTable.id)
+    .limit(limit)
+    .offset(offset);
 
-  // Matches the provider's own batch size, so one slice is one API call.
-  const BATCH = 100;
-  let embedded = 0;
+  if (rows.length === 0) return { facts: 0, processed: 0, skipped: false };
 
-  for (let i = 0; i < factRows.length; i += BATCH) {
-    const slice = factRows.slice(i, i + BATCH);
-    const result = await embed(slice.map(renderFactForEmbedding));
-    if (!result.ok) {
-      // Similarity is an enhancement; the exact-key channels still work.
-      await markStage(documentId, "normalize", "skipped", { error: result.detail });
-      log.warn("embeddings unavailable; similarity linking disabled", { detail: result.detail });
-      return { facts: embedded, chunks: 0 };
-    }
-    await saveFactEmbeddings(
-      slice.map((row, k) => ({ factId: row.id, embedding: result.vectors[k] })),
-    );
-    embedded += slice.length;
+  const result = await embed(rows.map(renderFactForEmbedding));
+  if (!result.ok) {
+    await markStage(documentId, "normalize", "skipped", { error: result.detail });
+    log.warn("embeddings unavailable; similarity linking disabled", { detail: result.detail });
+    return { facts: 0, processed: 0, skipped: true, detail: result.detail };
   }
 
-  const chunkRows = await db
+  await saveFactEmbeddings(rows.map((row, k) => ({ factId: row.id, embedding: result.vectors[k] })));
+  return { facts: rows.length, processed: rows.length, skipped: false };
+}
+
+/** Chunk embeddings, for passage retrieval. Best effort; never fails a run. */
+export async function runEmbedChunks(documentId: string, limit: number): Promise<number> {
+  const db = getDb();
+  const rows = await db
     .select({ id: chunksTable.id, text: chunksTable.text })
     .from(chunksTable)
-    .where(eq(chunksTable.documentId, documentId));
+    .where(eq(chunksTable.documentId, documentId))
+    .limit(limit);
 
-  let chunksEmbedded = 0;
-  for (let i = 0; i < chunkRows.length; i += BATCH) {
-    const slice = chunkRows.slice(i, i + BATCH);
-    const result = await embed(slice.map((c) => c.text.slice(0, 6000)));
-    if (!result.ok) break;
-    await saveChunkEmbeddings(
-      slice.map((row, k) => ({ chunkId: row.id, embedding: result.vectors[k] })),
-    );
-    chunksEmbedded += slice.length;
-  }
+  if (rows.length === 0) return 0;
 
-  await markStage(documentId, "normalize", "done", {
-    metrics: { facts: embedded, chunks: chunksEmbedded },
-  });
-  return { facts: embedded, chunks: chunksEmbedded };
+  const result = await embed(rows.map((c) => c.text.slice(0, 6000)));
+  if (!result.ok) return 0;
+
+  await saveChunkEmbeddings(
+    rows.map((row, k) => ({ chunkId: row.id, embedding: result.vectors[k] })),
+  );
+  return rows.length;
 }
 
 /* ── link ─────────────────────────────────────────────────────────────────── */
@@ -614,16 +634,58 @@ export async function runLink(corpusId: string, documentIds: string[]): Promise<
   return { facts: linkable.length, pairs: pairs.length, relations: written, byType };
 }
 
-/* ── convenience ──────────────────────────────────────────────────────────── */
+/* ── convenience ─────────────────────────────────────────────── */
 
-/** Runs everything for one document, for local use and tests. */
+/**
+ * Runs every stage for one document, in one process.
+ *
+ * For local use and tests. In production Inngest drives the same functions, one
+ * step per invocation, which is what keeps each slice inside the platform's
+ * time limit — here they simply run back to back.
+ */
 export async function runAll(documentId: string, corpusId: string): Promise<void> {
   try {
     await setDocumentStatus(documentId, "processing");
-    const parse = await runParse(documentId);
-    if (!parse.usable) return;
-    await runExtract(documentId);
-    await runEmbed(documentId);
+
+    const prepared = await runPrepare(documentId);
+    if (!prepared.usable) return;
+
+    const pageBatch = Math.max(1, env.parsePageBatch);
+    let chunkOffset = 0;
+    for (let from = 1; from <= prepared.pageCount; from += pageBatch) {
+      const to = Math.min(from + pageBatch - 1, prepared.pageCount);
+      const batch = await runParseBatch(
+        documentId,
+        from,
+        to,
+        prepared.boilerplate,
+        chunkOffset,
+      );
+      if (batch.gone) return;
+      chunkOffset += batch.chunks;
+    }
+    await markStage(documentId, "parse", "done", { metrics: { pages: prepared.pageCount } });
+    await markStage(documentId, "chunk", "done", { metrics: { chunks: chunkOffset } });
+
+    const tables = await runExtractTables(documentId);
+    if (tables.gone) return;
+
+    const chunkBatch = Math.max(1, env.extractChunkBatch);
+    for (let offset = 0; ; offset += chunkBatch) {
+      const out = await runExtractNarrative(documentId, offset, chunkBatch);
+      if (out.gone || out.skipped || out.processed === 0) break;
+    }
+    await markStage(documentId, "extract", "done");
+
+    const embedBatch = Math.max(1, env.embedFactBatch);
+    for (let offset = 0; ; offset += embedBatch) {
+      const out = await runEmbedBatch(documentId, offset, embedBatch);
+      if (out.gone || out.skipped || out.processed === 0) {
+        if (!out.skipped) await markStage(documentId, "normalize", "done");
+        break;
+      }
+    }
+
     await runLink(corpusId, [documentId]);
   } catch (error) {
     const detail = String((error as Error)?.message ?? error);
@@ -632,5 +694,3 @@ export async function runAll(documentId: string, corpusId: string): Promise<void
     throw error;
   }
 }
-
-export { env };
