@@ -51,12 +51,18 @@ type Relation = {
   filenameB: string;
 };
 
+/**
+ * Order matters: the first entry is what a reader sees on arrival. Reconciled
+ * leads because it is the system's central result — differences explained by
+ * period, scope or unit — and mirrors the rule that reconciliation is always
+ * attempted before contradiction.
+ */
 const FAMILIES: FilterOption[] = [
   {
-    value: "contradiction",
-    label: "Contradictions",
+    value: "reconciliation",
+    label: "Reconciled",
     description:
-      "Same measure, same period, same stated scope — and different figures. Nothing explains the gap.",
+      "Figures that look like they disagree until you read the period, scope, basis or unit.",
   },
   {
     value: "corroboration",
@@ -65,10 +71,10 @@ const FAMILIES: FilterOption[] = [
       "Independent statements that agree, including ones written in different units or wording.",
   },
   {
-    value: "reconciliation",
-    label: "Reconciled",
+    value: "contradiction",
+    label: "Contradictions",
     description:
-      "Figures that look like they disagree until you read the period, scope, basis or unit.",
+      "Same measure, same period, same stated scope — and different figures. Nothing explains the gap.",
   },
   {
     value: "inconclusive",
@@ -88,7 +94,7 @@ const MEMBERS: Record<string, (type: string) => boolean> = {
 
 function FindingsInner() {
   const params = useSearchParams();
-  const [family, setFamily] = useState(params.get("family") ?? "contradiction");
+  const [family, setFamily] = useState(params.get("family") ?? "reconciliation");
   const [crossOnly, setCrossOnly] = useState(false);
   const [data, setData] = useState<{
     relations: Relation[];

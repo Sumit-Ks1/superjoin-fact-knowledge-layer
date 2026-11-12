@@ -17,6 +17,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { describeSkippedStage } from "@/lib/user-message";
 
+import { PlatformOverview } from "@/components/platform-overview";
 import {
   Badge,
   Button,
@@ -25,7 +26,6 @@ import {
   FilterGroup,
   Loading,
   Notice,
-  PageHeader,
   type FilterOption,
   type Tone,
 } from "@/components/ui";
@@ -202,11 +202,16 @@ export default function DocumentsPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Documents">
-        Upload any PDFs that ought to talk about the same things. Findings come from comparing
-        documents, so a second upload re-examines everything already here.
-        
-      </PageHeader>
+      <PlatformOverview />
+
+      <header id="documents" className="border-b border-line pb-5 pt-4">
+        <p className="text-xs font-semibold uppercase tracking-widest text-faint">Try it</p>
+        <h2 className="mt-1.5 text-2xl font-semibold tracking-tight text-ink">Documents</h2>
+        <p className="mt-2 max-w-2xl text-sm leading-relaxed text-muted">
+          Upload any PDFs that ought to talk about the same things. Findings come from comparing
+          documents, so a second upload re-examines everything already here.
+        </p>
+      </header>
 
       <Card className="border-dashed p-6">
         <label className="block">
@@ -261,12 +266,12 @@ export default function DocumentsPage() {
             </div>
 
             <div className="mt-4 flex flex-wrap items-center gap-1.5">
-              {STAGES.map((stage) => {
+              {/* {STAGES.map((stage) => {
                 const found = row.stages.find((s) => s.stage === stage);
                 return (
                   <StagePill key={stage} stage={stage} status={found?.status ?? "pending"} />
                 );
-              })}
+              })} */}
             </div>
 
             {/* What a skipped step means for the reader — derived from the
